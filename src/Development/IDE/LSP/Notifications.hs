@@ -12,6 +12,7 @@ import           Development.IDE.LSP.Server
 import qualified Language.Haskell.LSP.Core        as LSP
 import           Language.Haskell.LSP.Types
 import qualified Language.Haskell.LSP.Types       as LSP
+import qualified Language.Haskell.LSP.Messages    as LSP
 
 import           Development.IDE.Core.IdeConfiguration
 import           Development.IDE.Core.Service
@@ -21,7 +22,9 @@ import           Development.IDE.Types.Logger
 import           Development.IDE.Types.Options
 
 import           Control.Monad.Extra
+import qualified Data.Aeson                       as A
 import           Data.Foldable                    as F
+import           Data.List (intercalate)
 import           Data.Maybe
 import qualified Data.HashMap.Strict              as M
 import qualified Data.HashSet                     as S
@@ -72,6 +75,8 @@ setHandlersNotifications = PartialHandlers $ \WithMessage{..} x -> return x
                 logInfo (ideLogger ide) $ "Closed text document: " <> getUri _uri
     ,LSP.didChangeWatchedFilesNotificationHandler = withNotification (LSP.didChangeWatchedFilesNotificationHandler x) $
         \_ ide (DidChangeWatchedFilesParams fileEvents) -> do
+            -- See Note [File existence cache and LSP file watchers] which explains why we get these notifications and
+            -- what we do with them
             let events =
                     mapMaybe
                         (\(FileEvent uri ev) ->
@@ -98,4 +103,32 @@ setHandlersNotifications = PartialHandlers $ \WithMessage{..} x -> return x
             logInfo (ideLogger ide) $ "Configuration changed: " <> msg
             modifyClientSettings ide (const $ Just cfg)
             setSomethingModified ide
+
+    -- Initialized handler, good time to dynamically register capabilities
+    ,LSP.initializedHandler = withNotification (LSP.initializedHandler x) $ \LSP.LspFuncs{..} ide _ -> do
+        lspId <- getNextReqId
+        opts <- getIdeOptionsIO $ shakeExtras ide
+        let
+          req = RequestMessage "2.0" lspId ClientRegisterCapability regParams
+          regParams    = RegistrationParams (List [registration])
+          -- The registration ID is arbitrary and is only used in case we want to deregister (which we won't).
+          -- We could also use something like a random UUID, as some other servers do, but this works for
+          -- our purposes.
+          registration = Registration "globalFileWatches"
+                                      WorkspaceDidChangeWatchedFiles
+                                      (Just (A.toJSON regOptions))
+          regOptions =
+            DidChangeWatchedFilesRegistrationOptions { _watchers = List [watcher] }
+          exts = optExtensions opts
+          extsBoot = fmap (\ext -> ext ++ "-boot") exts
+          -- See Note [File existence cache and LSP file watchers] for why this exists, and the choice of watch kind
+          watchKind = WatchKind { _watchCreate = True, _watchChange = False, _watchDelete = True}
+          -- See Note [What files should we watch?] for an explanation of why the pattern is the way that it is
+          -- The pattern will be something like "**/.{hs,lhs,hs-boot,lhs-boot}", i.e. "any number of directory segments,
+          -- followed by a file with extension 'hs' or 'lhs'".
+          watcher = FileSystemWatcher { _globPattern = "**/*.{" ++ intercalate "," (exts ++ extsBoot) ++ "}"
+                                      , _kind        = Just watchKind
+                                      }
+
+        sendFunc $ LSP.ReqRegisterCapability req
     }
