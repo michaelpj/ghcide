@@ -72,6 +72,8 @@ setHandlersNotifications = PartialHandlers $ \WithMessage{..} x -> return x
                 logInfo (ideLogger ide) $ "Closed text document: " <> getUri _uri
     ,LSP.didChangeWatchedFilesNotificationHandler = withNotification (LSP.didChangeWatchedFilesNotificationHandler x) $
         \_ ide (DidChangeWatchedFilesParams fileEvents) -> do
+            -- See Note [File existence cache and LSP file watchers] which explains why we get these notifications and
+            -- what we do with them
             let events =
                     mapMaybe
                         (\(FileEvent uri ev) ->

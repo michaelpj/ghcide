@@ -16,13 +16,14 @@ import           Data.Binary
 import qualified Data.ByteString               as BS
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
+import           Data.List
 import           Data.Maybe
-import qualified Data.Text                     as T
 import           Development.IDE.Core.FileStore
 import           Development.IDE.Core.IdeConfiguration
 import           Development.IDE.Core.Shake
 import           Development.IDE.Types.Location
 import           Development.IDE.Types.Logger
+import           Development.IDE.Types.Options
 import           Development.Shake
 import           Development.Shake.Classes
 import           GHC.Generics
@@ -31,36 +32,62 @@ import           Language.Haskell.LSP.Types
 import           Language.Haskell.LSP.Types.Capabilities
 import qualified System.Directory as Dir
 
--- | A map for tracking the file existence
+{- Note [File existence cache and LSP file watchers]
+Some LSP servers provide the ability to register file watches with the client, which will then notify
+us of file changes. Some clients can do this more efficiently than us, or generally it's a tricky
+problem
+
+Here we use this to maintain a quick lookup cache of file existence. How this works is:
+- On startup, if the client supports it we ask it to watch some files (see below).
+- When those files are created or deleted (we can also see change events, but we don't
+care since we're only caching existence here) we get a notification from the client.
+- The notification handler calls 'modifyFileExists' to update our cache.
+
+This means that the cache will only ever work for the files we have set up a watcher for.
+So we pick the set that we mostly care about and which are likely to change existence
+most often: the source files of the project (as determined by the source extensions
+we're configured to care about).
+
+For all other files we fall back to the slow path.
+-}
+
+-- See Note [File existence cache and LSP file watchers]
+-- | A map for tracking the file existence.
+-- If a path maps to 'True' then it exists; if it maps to 'False' then it doesn't exist'; and
+-- if it's not in the map then we don't know.
 type FileExistsMap = (HashMap NormalizedFilePath Bool)
 
--- | A wrapper around a mutable 'FileExistsMap'
-newtype FileExistsMapVar = FileExistsMapVar (Var FileExistsMap)
+-- | The state of our file existence cache. A pair of a boolean indicating whether we have initialized the
+-- file watcher in the client yet, and a map tracking file existence.
+data FileExistsState = FileExistsState { fileExistsWatcherInitialized :: Bool, fileExistsMap :: FileExistsMap }
 
-instance IsIdeGlobal FileExistsMapVar
+-- | A wrapper around a mutable 'FileExistsState'
+newtype FileExistsStateVar = FileExistsStateVar (Var FileExistsState)
 
--- | Grab the current global value of 'FileExistsMap' without acquiring a dependency
-getFileExistsMapUntracked :: Action FileExistsMap
-getFileExistsMapUntracked = do
-  FileExistsMapVar v <- getIdeGlobalAction
+instance IsIdeGlobal FileExistsStateVar
+
+-- | Grab the current global value of 'FileExistsState' without acquiring a dependency
+getFileExistsStateUntracked :: Action FileExistsState
+getFileExistsStateUntracked = do
+  FileExistsStateVar v <- getIdeGlobalAction
   liftIO $ readVar v
 
 -- | Modify the global store of file exists
-modifyFileExistsAction :: (FileExistsMap -> IO FileExistsMap) -> Action ()
-modifyFileExistsAction f = do
-  FileExistsMapVar var <- getIdeGlobalAction
+modifyFileExistsStateAction :: (FileExistsState -> IO FileExistsState) -> Action ()
+modifyFileExistsStateAction f = do
+  FileExistsStateVar var <- getIdeGlobalAction
   liftIO $ modifyVar_ var f
 
--- | Modify the global store of file exists
+-- | Modify the global store of file exists.
 modifyFileExists :: IdeState -> [(NormalizedFilePath, Bool)] -> IO ()
 modifyFileExists state changes = do
-  FileExistsMapVar var <- getIdeGlobalState state
+  FileExistsStateVar var <- getIdeGlobalState state
   changesMap           <- evaluate $ HashMap.fromList changes
 
   -- Masked to ensure that the previous values are flushed together with the map update
   mask $ \_ -> do
     -- update the map
-    modifyVar_ var $ evaluate . HashMap.union changesMap
+    modifyVar_ var $ \st -> evaluate $ st{fileExistsMap=HashMap.union changesMap (fileExistsMap st)}
     -- flush previous values
     mapM_ (deleteValue state GetFileExists . fst) changes
 
@@ -95,7 +122,8 @@ fileExistsRules getLspId ClientCapabilities{_workspace} vfs = do
   -- Create the global always, although it should only be used if we have fast rules.
   -- But there's a chance someone will send unexpected notifications anyway,
   -- e.g. https://github.com/digital-asset/ghcide/issues/599
-  addIdeGlobal . FileExistsMapVar =<< liftIO (newVar [])
+  addIdeGlobal . FileExistsStateVar =<< liftIO (newVar (FileExistsState False []))
+
   case () of
     _ | Just WorkspaceClientCapabilities{_didChangeWatchedFiles} <- _workspace
       , Just DidChangeWatchedFilesClientCapabilities{_dynamicRegistration} <- _didChangeWatchedFiles
@@ -106,57 +134,82 @@ fileExistsRules getLspId ClientCapabilities{_workspace} vfs = do
         liftIO $ logDebug logger "Warning: Client does not support watched files. Falling back to OS polling"
         fileExistsRulesSlow vfs
 
---   Requires an lsp client that provides WatchedFiles notifications.
+-- Requires an lsp client that provides WatchedFiles notifications, but assumes that this has already been checked.
 fileExistsRulesFast :: IO LspId -> VFSHandle -> Rules ()
-fileExistsRulesFast getLspId vfs =
-  defineEarlyCutoff $ \GetFileExists file -> do
-    isWf <- isWorkspaceFile file
-    if isWf
-        then fileExistsFast getLspId vfs file
-        else fileExistsSlow vfs file
+fileExistsRulesFast getLspId vfs = do
+    defineEarlyCutoff $ \GetFileExists file -> do
+      isWf <- isWorkspaceFile file
+      if isWf
+          then fileExistsFast getLspId vfs file
+          else fileExistsSlow vfs file
 
-fileExistsFast :: IO LspId -> VFSHandle -> NormalizedFilePath -> Action (Maybe BS.ByteString, ([a], Maybe Bool))
-fileExistsFast getLspId vfs file = do
-    fileExistsMap <- getFileExistsMapUntracked
-    let mbFilesWatched = HashMap.lookup file fileExistsMap
-    case mbFilesWatched of
-      Just fv -> pure (summarizeExists fv, ([], Just fv))
-      Nothing -> do
-        exist                   <- liftIO $ getFileExistsVFS vfs file
-        ShakeExtras { eventer } <- getShakeExtras
+{- Note [Which files should we watch?]
+The watcher system gives us a lot of flexibility: we can set multiple watchers, and they can all watch on glob
+patterns.
 
-        -- add a listener for VFS Create/Delete file events,
-        -- taking the FileExistsMap lock to prevent race conditions
-        -- that would lead to multiple listeners for the same path
-        modifyFileExistsAction $ \x -> do
-          case HashMap.alterF (,Just exist) file x of
-            (Nothing, x') -> do
-            -- if the listener addition fails, we never recover. This is a bug.
-              addListener eventer file
-              return x'
-            (Just _, _) ->
-              -- if the key was already there, do nothing
-              return x
+We used to have a quite precise system, where we would register a watcher for a single file path only (and always)
+when we actually looked to see if it existed. The downside of this is that it sends a *lot* of notifications
+to the client (thousands on a large project), and this could lock up some clients like emacs
+(https://github.com/emacs-lsp/lsp-mode/issues/2165).
 
-        pure (summarizeExists exist, ([], Just exist))
- where
-  addListener eventer fp = do
-    reqId <- getLspId
+Now we take the opposite approach: we register a single, quite general watcher that looks for all files
+with a predefined set of extensions. The consequences are:
+- The client will have to watch more files. This is usually not too bad, since the pattern is a single glob,
+and the clients typically call out to an optimized implementation of file watching that understands globs.
+- The client will send us a lot more notifications. This isn't too bad in practice, since although
+we're watching a lot of files in principle, they don't get created or destroyed that often.
+- We won't ever hit the fast lookup path for files which aren't in our watch pattern, since the only way
+files get into our map is when the client sends us a notification about them because we're watching them.
+This is fine so long as we're watching the files we check most often, i.e. source files.
+-}
+
+-- | Register the global file watcher. Requires an lsp client that provides WatchedFiles notifications, but
+-- assumes that this has already been checked.
+registerWatcher :: IO LspId -> Action ()
+registerWatcher getLspId = do
+    ide <- getShakeExtras
+    opts <- getIdeOptions
+    lspId <- liftIO getLspId
     let
-      req = RequestMessage "2.0" reqId ClientRegisterCapability regParams
-      fpAsId       = T.pack $ fromNormalizedFilePath fp
+      req = RequestMessage "2.0" lspId ClientRegisterCapability regParams
       regParams    = RegistrationParams (List [registration])
-      registration = Registration fpAsId
+      -- The registration ID is arbitrary and is only used in case we want to deregister (which we won't).
+      -- We could also use something like a random UUID, as some other servers do, but this works for
+      -- our purposes.
+      registration = Registration "globalFileWatches"
                                   WorkspaceDidChangeWatchedFiles
                                   (Just (A.toJSON regOptions))
       regOptions =
         DidChangeWatchedFilesRegistrationOptions { _watchers = List [watcher] }
+      exts = optExtensions opts
+      -- See Note [File existence cache and LSP file watchers] for why this exists, and the choice of watch kind
       watchKind = WatchKind { _watchCreate = True, _watchChange = False, _watchDelete = True}
-      watcher = FileSystemWatcher { _globPattern = fromNormalizedFilePath fp
+      -- See Note [What files should we watch?] for an explanation of why the pattern is the way that it is
+      -- The pattern will be something like "**/.{hs,lhs}", i.e. "any number of directory segments,
+      -- followed by a file with extension 'hs' or 'lhs'".
+      watcher = FileSystemWatcher { _globPattern = "**/*.{" ++ intercalate "," exts ++ "}"
                                   , _kind        = Just watchKind
                                   }
 
-    eventer $ ReqRegisterCapability req
+    liftIO $ eventer ide $ ReqRegisterCapability req
+
+fileExistsFast :: IO LspId -> VFSHandle -> NormalizedFilePath -> Action (Maybe BS.ByteString, ([a], Maybe Bool))
+fileExistsFast getLspId vfs file = do
+    FileExistsState{fileExistsWatcherInitialized, fileExistsMap} <- getFileExistsStateUntracked
+
+    -- If we have not yet registered the file watcher, then do so now.
+    -- We do this on the first run of 'fileExistsFast' rather than in, say 'fileExistsRules' because
+    -- we can't send any messages then: they'd be sent before we are finished initializing the server
+    -- which is illegal. So we delay it to here.
+    unless fileExistsWatcherInitialized $ do
+        registerWatcher getLspId
+        modifyFileExistsStateAction $ \st -> pure $ st { fileExistsWatcherInitialized=True }
+
+    let mbFilesWatched = HashMap.lookup file fileExistsMap
+    exist <- case mbFilesWatched of
+      Just exist -> pure exist
+      Nothing -> liftIO $ getFileExistsVFS vfs file
+    pure (summarizeExists exist, ([], Just exist))
 
 summarizeExists :: Bool -> Maybe BS.ByteString
 summarizeExists x = Just $ if x then BS.singleton 1 else BS.empty
