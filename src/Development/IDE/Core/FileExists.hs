@@ -165,11 +165,8 @@ This is fine so long as we're watching the files we check most often, i.e. sourc
 
 -- | Register the global file watcher. Requires an lsp client that provides WatchedFiles notifications, but
 -- assumes that this has already been checked.
-registerWatcher :: IO LspId -> Action ()
-registerWatcher getLspId = do
-    ide <- getShakeExtras
-    opts <- getIdeOptions
-    lspId <- liftIO getLspId
+registerWatcher :: LspId -> ShakeExtras -> IdeOptions -> IO ()
+registerWatcher lspId ide opts = do
     let
       req = RequestMessage "2.0" lspId ClientRegisterCapability regParams
       regParams    = RegistrationParams (List [registration])
@@ -195,17 +192,25 @@ registerWatcher getLspId = do
 
 fileExistsFast :: IO LspId -> VFSHandle -> NormalizedFilePath -> Action (Maybe BS.ByteString, ([a], Maybe Bool))
 fileExistsFast getLspId vfs file = do
-    FileExistsState{fileExistsWatcherInitialized, fileExistsMap} <- getFileExistsStateUntracked
+    st <- getFileExistsStateUntracked
 
     -- If we have not yet registered the file watcher, then do so now.
     -- We do this on the first run of 'fileExistsFast' rather than in, say 'fileExistsRules' because
     -- we can't send any messages then: they'd be sent before we are finished initializing the server
     -- which is illegal. So we delay it to here.
-    unless fileExistsWatcherInitialized $ do
-        registerWatcher getLspId
-        modifyFileExistsStateAction $ \st -> pure $ st { fileExistsWatcherInitialized=True }
+    unless (fileExistsWatcherInitialized st) $ do
+        ide <- getShakeExtras
+        opts <- getIdeOptions
+        -- Check again with the lock held: so we definitely only send the message once
+        modifyFileExistsStateAction $ \st -> do
+            unless (fileExistsWatcherInitialized st) $ do
+                lspId <- getLspId
+                registerWatcher lspId ide opts
+            -- Either it was already true, in which case this does nothing,
+            -- or we're setting it now
+            pure $ st { fileExistsWatcherInitialized=True }
 
-    let mbFilesWatched = HashMap.lookup file fileExistsMap
+    let mbFilesWatched = HashMap.lookup file (fileExistsMap st)
     exist <- case mbFilesWatched of
       Just exist -> pure exist
       Nothing -> liftIO $ getFileExistsVFS vfs file
