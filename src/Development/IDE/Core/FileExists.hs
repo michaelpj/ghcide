@@ -78,6 +78,21 @@ modifyFileExistsStateAction f = do
   FileExistsStateVar var <- getIdeGlobalAction
   liftIO $ modifyVar_ var f
 
+{- Note [Invalidating file existence results]
+We have two mechanisms for getting file existence information:
+- The file existence cache
+- The VFS lookup
+
+Both of these affect the results of the 'GetFileExists' rule, so we need to make sure it
+is invalidated properly when things change.
+
+For the file existence cache, we manually flush the results of 'GetFileExists' when we
+modify it (i.e. when a notification comes from the client).
+
+For the VFS lookup, however, we won't get prompted to flush the result, so instead
+we use 'alwaysRerun'.
+-}
+
 -- | Modify the global store of file exists.
 modifyFileExists :: IdeState -> [(NormalizedFilePath, Bool)] -> IO ()
 modifyFileExists state changes = do
@@ -88,7 +103,7 @@ modifyFileExists state changes = do
   mask $ \_ -> do
     -- update the map
     modifyVar_ var $ \st -> evaluate $ st{fileExistsMap=HashMap.union changesMap (fileExistsMap st)}
-    -- flush previous values
+    -- flush previous values, see Note [Invalidating file existence results]
     mapM_ (deleteValue state GetFileExists . fst) changes
 
 -------------------------------------------------------------------------------------
@@ -211,20 +226,23 @@ fileExistsFast getLspId vfs file = do
             pure $ st { fileExistsWatcherInitialized=True }
 
     let mbFilesWatched = HashMap.lookup file (fileExistsMap st)
-    exist <- case mbFilesWatched of
-      Just exist -> pure exist
-      Nothing -> liftIO $ getFileExistsVFS vfs file
-    pure (summarizeExists exist, ([], Just exist))
+    case mbFilesWatched of
+      Just exist -> pure (summarizeExists exist, ([], Just exist))
+      -- We don't know about it: back to fileExistsSlow we go.
+      -- We need to call it explicitly so we invalidate the rule result for this
+      -- case correctly, see Note [Invalidating file existence results]
+      Nothing -> fileExistsSlow vfs file
 
 summarizeExists :: Bool -> Maybe BS.ByteString
 summarizeExists x = Just $ if x then BS.singleton 1 else BS.empty
 
-fileExistsRulesSlow:: VFSHandle -> Rules ()
+fileExistsRulesSlow :: VFSHandle -> Rules ()
 fileExistsRulesSlow vfs =
   defineEarlyCutoff $ \GetFileExists file -> fileExistsSlow vfs file
 
 fileExistsSlow :: VFSHandle -> NormalizedFilePath -> Action (Maybe BS.ByteString, ([a], Maybe Bool))
 fileExistsSlow vfs file = do
+    -- See Note [Invalidating file existence results]
     alwaysRerun
     exist <- liftIO $ getFileExistsVFS vfs file
     pure (summarizeExists exist, ([], Just exist))
