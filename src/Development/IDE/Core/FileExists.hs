@@ -97,6 +97,12 @@ For the VFS lookup, however, we won't get prompted to flush the result, so inste
 we use 'alwaysRerun'.
 -}
 
+-- | Modify the global store of file exists
+modifyFileExistsAction :: (FileExistsMap -> IO FileExistsMap) -> Action ()
+modifyFileExistsAction f = do
+  FileExistsMapVar var <- getIdeGlobalAction
+  liftIO $ modifyVar_ var f
+
 -- | Modify the global store of file exists.
 modifyFileExists :: IdeState -> [(NormalizedFilePath, Bool)] -> IO ()
 modifyFileExists state changes = do
@@ -201,7 +207,11 @@ fileExistsFast vfs file = do
       -- We don't know about it: back to fileExistsSlow we go.
       -- We need to call it explicitly so we invalidate the rule result for this
       -- case correctly, see Note [Invalidating file existence results]
-      Nothing -> liftIO $ getFileExistsVFS vfs file
+      Nothing -> do
+          exist <- liftIO $ getFileExistsVFS vfs file
+          modifyFileExistsAction $ \mp -> pure $ HashMap.insert file exist mp
+          pure exist
+
     pure (summarizeExists exist, ([], Just exist))
 
 summarizeExists :: Bool -> Maybe BS.ByteString
