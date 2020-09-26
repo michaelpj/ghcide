@@ -5,6 +5,7 @@ module Development.IDE.Core.FileExists
   ( fileExistsRules
   , modifyFileExists
   , getFileExists
+  , watchedFileExtensions
   )
 where
 
@@ -16,6 +17,7 @@ import qualified Data.ByteString               as BS
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
 import           Data.Maybe
+import qualified Data.Text as T
 import           Development.IDE.Core.FileStore
 import           Development.IDE.Core.IdeConfiguration
 import           Development.IDE.Core.Shake
@@ -26,6 +28,8 @@ import           Development.Shake.Classes
 import           GHC.Generics
 import           Language.Haskell.LSP.Types.Capabilities
 import qualified System.Directory as Dir
+import Development.IDE.Types.Options
+import Data.String
 
 {- Note [File existence cache and LSP file watchers]
 Some LSP servers provide the ability to register file watches with the client, which will then notify
@@ -129,6 +133,10 @@ instance Binary   GetFileExists
 getFileExists :: NormalizedFilePath -> Action Bool
 getFileExists fp = use_ GetFileExists fp
 
+-- | The set of file extensions that we ask the client to watch, without the leading dots.
+watchedFileExtensions :: IdeOptions -> [T.Text]
+watchedFileExtensions opts = concatMap (\e -> [fromString e, fromString (e ++ "-boot")]) (optExtensions opts)
+
 -- | Installs the 'getFileExists' rules.
 --   Provides a fast implementation if client supports dynamic watched files.
 --   Creates a global state as a side effect in that case.
@@ -139,24 +147,29 @@ fileExistsRules ClientCapabilities{_workspace} vfs = do
   -- e.g. https://github.com/digital-asset/ghcide/issues/599
   addIdeGlobal . FileExistsMapVar =<< liftIO (newVar [])
 
+  extras <- getShakeExtrasRules
+  opts <- liftIO $ getIdeOptionsIO extras
+  let watchedExtensions = watchedFileExtensions opts
+
   case () of
     _ | Just WorkspaceClientCapabilities{_didChangeWatchedFiles} <- _workspace
       , Just DidChangeWatchedFilesClientCapabilities{_dynamicRegistration} <- _didChangeWatchedFiles
       , Just True <- _dynamicRegistration
-        -> fileExistsRulesFast vfs
+        -> fileExistsRulesFast watchedExtensions vfs
       | otherwise -> do
         logger <- logger <$> getShakeExtrasRules
         liftIO $ logDebug logger "Warning: Client does not support watched files. Falling back to OS polling"
         fileExistsRulesSlow vfs
 
 -- Requires an lsp client that provides WatchedFiles notifications, but assumes that this has already been checked.
-fileExistsRulesFast :: VFSHandle -> Rules ()
-fileExistsRulesFast vfs = do
+fileExistsRulesFast :: [T.Text] -> VFSHandle -> Rules ()
+fileExistsRulesFast fastExts vfs = do
     defineEarlyCutoff $ \GetFileExists file -> do
-      isWf <- isWorkspaceFile file
-      if isWf
-          then fileExistsFast vfs file
-          else fileExistsSlow vfs file
+        isWf <- isWorkspaceFile file
+        let fp = fromNormalizedFilePath file
+        if isWf && any (\ext -> ext `T.isSuffixOf` fromString fp) fastExts
+            then fileExistsFast vfs file
+            else fileExistsSlow vfs file
 
 {- Note [Which files should we watch?]
 The watcher system gives us a lot of flexibility: we can set multiple watchers, and they can all watch on glob

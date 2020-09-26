@@ -3,6 +3,7 @@
 
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE RankNTypes            #-}
+{-# LANGUAGE OverloadedStrings     #-}
 
 module Development.IDE.LSP.Notifications
     ( setHandlersNotifications
@@ -24,14 +25,13 @@ import           Development.IDE.Types.Options
 import           Control.Monad.Extra
 import qualified Data.Aeson                       as A
 import           Data.Foldable                    as F
-import           Data.List (intercalate)
 import           Data.Maybe
 import qualified Data.HashMap.Strict              as M
 import qualified Data.HashSet                     as S
 import qualified Data.Text                        as Text
 
 import           Development.IDE.Core.FileStore   (setSomethingModified, setFileModified, typecheckParents)
-import           Development.IDE.Core.FileExists  (modifyFileExists)
+import           Development.IDE.Core.FileExists  (modifyFileExists, watchedFileExtensions)
 import           Development.IDE.Core.OfInterest
 
 
@@ -119,14 +119,13 @@ setHandlersNotifications = PartialHandlers $ \WithMessage{..} x -> return x
                                       (Just (A.toJSON regOptions))
           regOptions =
             DidChangeWatchedFilesRegistrationOptions { _watchers = List [watcher] }
-          exts = optExtensions opts
-          extsBoot = fmap (\ext -> ext ++ "-boot") exts
           -- See Note [File existence cache and LSP file watchers] for why this exists, and the choice of watch kind
           watchKind = WatchKind { _watchCreate = True, _watchChange = False, _watchDelete = True}
+          exts = watchedFileExtensions opts
           -- See Note [What files should we watch?] for an explanation of why the pattern is the way that it is
           -- The pattern will be something like "**/.{hs,lhs,hs-boot,lhs-boot}", i.e. "any number of directory segments,
           -- followed by a file with extension 'hs' or 'lhs'".
-          watcher = FileSystemWatcher { _globPattern = "**/*.{" ++ intercalate "," (exts ++ extsBoot) ++ "}"
+          watcher = FileSystemWatcher { _globPattern = "**/*.{" ++ show (Text.intercalate "," exts) ++ "}"
                                       , _kind        = Just watchKind
                                       }
 
