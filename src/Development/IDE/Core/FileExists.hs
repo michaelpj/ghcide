@@ -153,6 +153,7 @@ fileExistsRules getLspId ClientCapabilities{_workspace} vfs = do
 fileExistsRulesFast :: IO LspId -> VFSHandle -> Rules ()
 fileExistsRulesFast getLspId vfs = do
     defineEarlyCutoff $ \GetFileExists file -> do
+      alwaysRerun
       isWf <- isWorkspaceFile file
       if isWf
           then fileExistsFast getLspId vfs file
@@ -229,7 +230,8 @@ fileExistsFast getLspId vfs file = do
     case mbFilesWatched of
       Just exist -> pure (summarizeExists exist, ([], Just exist))
       -- We don't know about it: back to fileExistsSlow we go.
-      -- We need to call it explicitly so we invalidate the rule result for this
+
+    -- We need to call it explicitly so we invalidate the rule result for this
       -- case correctly, see Note [Invalidating file existence results]
       Nothing -> fileExistsSlow vfs file
 
@@ -238,12 +240,11 @@ summarizeExists x = Just $ if x then BS.singleton 1 else BS.empty
 
 fileExistsRulesSlow :: VFSHandle -> Rules ()
 fileExistsRulesSlow vfs =
-  defineEarlyCutoff $ \GetFileExists file -> fileExistsSlow vfs file
+  defineEarlyCutoff $ \GetFileExists file -> alwaysRerun >> fileExistsSlow vfs file
 
 fileExistsSlow :: VFSHandle -> NormalizedFilePath -> Action (Maybe BS.ByteString, ([a], Maybe Bool))
 fileExistsSlow vfs file = do
     -- See Note [Invalidating file existence results]
-    alwaysRerun
     exist <- liftIO $ getFileExistsVFS vfs file
     pure (summarizeExists exist, ([], Just exist))
 
