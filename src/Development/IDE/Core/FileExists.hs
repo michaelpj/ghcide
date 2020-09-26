@@ -196,12 +196,13 @@ fileExistsFast vfs file = do
     mp <- getFileExistsMapUntracked
 
     let mbFilesWatched = HashMap.lookup file mp
-    case mbFilesWatched of
-      Just exist -> pure (summarizeExists exist, ([], Just exist))
+    exist <- case mbFilesWatched of
+      Just exist -> pure exist
       -- We don't know about it: back to fileExistsSlow we go.
       -- We need to call it explicitly so we invalidate the rule result for this
       -- case correctly, see Note [Invalidating file existence results]
-      Nothing -> fileExistsSlow vfs file
+      Nothing -> liftIO $ getFileExistsVFS vfs file
+    pure (summarizeExists exist, ([], Just exist))
 
 summarizeExists :: Bool -> Maybe BS.ByteString
 summarizeExists x = Just $ if x then BS.singleton 1 else BS.empty
