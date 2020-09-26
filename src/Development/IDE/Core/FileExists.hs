@@ -19,7 +19,6 @@ import qualified Data.HashMap.Strict as HashMap
 import           Data.List
 import           Data.Maybe
 import           Development.IDE.Core.FileStore
-import           Development.IDE.Core.IdeConfiguration
 import           Development.IDE.Core.Shake
 import           Development.IDE.Types.Location
 import           Development.IDE.Types.Logger
@@ -134,26 +133,22 @@ getFileExists fp = use_ GetFileExists fp
 --   Creates a global state as a side effect in that case.
 fileExistsRules :: IO LspId -> ClientCapabilities -> VFSHandle -> Rules ()
 fileExistsRules getLspId ClientCapabilities{_workspace} vfs = do
-  -- Create the global always, although it should only be used if we have fast rules.
-  -- But there's a chance someone will send unexpected notifications anyway,
-  -- e.g. https://github.com/digital-asset/ghcide/issues/599
-  addIdeGlobal . FileExistsStateVar =<< liftIO (newVar (FileExistsState False []))
+    -- Create the global always, although it should only be used if we have fast rules.
+    -- But there's a chance someone will send unexpected notifications anyway,
+    -- e.g. https://github.com/digital-asset/ghcide/issues/599
+    addIdeGlobal . FileExistsStateVar =<< liftIO (newVar (FileExistsState False []))
 
-  watchSupported = case () of
-    _ | Just WorkspaceClientCapabilities{_didChangeWatchedFiles} <- _workspace
-      , Just DidChangeWatchedFilesClientCapabilities{_dynamicRegistration} <- _didChangeWatchedFiles
-      , Just True <- _dynamicRegistration
-        -> pure True
-      | otherwise -> False
+    let watchSupported = case () of
+          _ | Just WorkspaceClientCapabilities{_didChangeWatchedFiles} <- _workspace
+            , Just DidChangeWatchedFilesClientCapabilities{_dynamicRegistration} <- _didChangeWatchedFiles
+            , Just True <- _dynamicRegistration
+              -> True
+            | otherwise -> False
 
-  unless watchSupported $ do
-      logger <- logger <$> getShakeExtrasRules
-      liftIO $ logDebug logger "Warning: Client does not support watched files. Falling back to OS polling"
+    unless watchSupported $ do
+        logger <- logger <$> getShakeExtrasRules
+        liftIO $ logDebug logger "Warning: Client does not support watched files. Falling back to OS polling"
 
-  fileExistsRules watchSupported getLspId vfs
-
-fileExistsRules :: Bool -> IO LspId -> VFSHandle -> Rules ()
-fileExistsRules watchSupported getLspId vfs = do
     defineEarlyCutoff $ \GetFileExists file -> do
       alwaysRerun
       if watchSupported
