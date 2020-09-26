@@ -134,29 +134,25 @@ getFileExists fp = use_ GetFileExists fp
 --   Creates a global state as a side effect in that case.
 fileExistsRules :: ClientCapabilities -> VFSHandle -> Rules ()
 fileExistsRules ClientCapabilities{_workspace} vfs = do
-  -- Create the global always, although it should only be used if we have fast rules.
-  -- But there's a chance someone will send unexpected notifications anyway,
-  -- e.g. https://github.com/digital-asset/ghcide/issues/599
-  addIdeGlobal . FileExistsMapVar =<< liftIO (newVar [])
+    -- Create the global always, although it should only be used if we have fast rules.
+    -- But there's a chance someone will send unexpected notifications anyway,
+    -- e.g. https://github.com/digital-asset/ghcide/issues/599
+    addIdeGlobal . FileExistsMapVar =<< liftIO (newVar [])
 
-  case () of
-    _ | Just WorkspaceClientCapabilities{_didChangeWatchedFiles} <- _workspace
-      , Just DidChangeWatchedFilesClientCapabilities{_dynamicRegistration} <- _didChangeWatchedFiles
-      , Just True <- _dynamicRegistration
-        -> fileExistsRulesFast vfs
-      | otherwise -> do
+    let watchSupported = case () of
+              _ | Just WorkspaceClientCapabilities{_didChangeWatchedFiles} <- _workspace
+                , Just DidChangeWatchedFilesClientCapabilities{_dynamicRegistration} <- _didChangeWatchedFiles
+                , Just True <- _dynamicRegistration
+                  -> True
+                | otherwise -> False
+
+    unless watchSupported $ do
         logger <- logger <$> getShakeExtrasRules
         liftIO $ logDebug logger "Warning: Client does not support watched files. Falling back to OS polling"
-        fileExistsRulesSlow vfs
 
--- Requires an lsp client that provides WatchedFiles notifications, but assumes that this has already been checked.
-fileExistsRulesFast :: VFSHandle -> Rules ()
-fileExistsRulesFast vfs = do
     defineEarlyCutoff $ \GetFileExists file -> do
-      isWf <- isWorkspaceFile file
-      if isWf
-          then fileExistsFast vfs file
-          else fileExistsSlow vfs file
+        alwaysRerun
+        fileExistsFast watchSupported vfs file
 
 {- Note [Which files should we watch?]
 The watcher system gives us a lot of flexibility: we can set multiple watchers, and they can all watch on glob
@@ -178,31 +174,24 @@ files get into our map is when the client sends us a notification about them bec
 This is fine so long as we're watching the files we check most often, i.e. source files.
 -}
 
-fileExistsFast :: VFSHandle -> NormalizedFilePath -> Action (Maybe BS.ByteString, ([a], Maybe Bool))
-fileExistsFast vfs file = do
+fileExistsFast :: Bool -> VFSHandle -> NormalizedFilePath -> Action (Maybe BS.ByteString, ([a], Maybe Bool))
+fileExistsFast True vfs file = do
     mp <- getFileExistsMapUntracked
 
     let mbFilesWatched = HashMap.lookup file mp
-    case mbFilesWatched of
-      Just exist -> pure (summarizeExists exist, ([], Just exist))
+    exist <- case mbFilesWatched of
+      Just exist -> pure exist
       -- We don't know about it: back to fileExistsSlow we go.
       -- We need to call it explicitly so we invalidate the rule result for this
       -- case correctly, see Note [Invalidating file existence results]
-      Nothing -> fileExistsSlow vfs file
+      Nothing -> liftIO $ getFileExistsVFS vfs file
+    pure (summarizeExists exist, ([], Just exist))
+fileExistsFast False vfs file = do
+    exist <-liftIO $ getFileExistsVFS vfs file
+    pure (summarizeExists exist, ([], Just exist))
 
 summarizeExists :: Bool -> Maybe BS.ByteString
 summarizeExists x = Just $ if x then BS.singleton 1 else BS.empty
-
-fileExistsRulesSlow :: VFSHandle -> Rules ()
-fileExistsRulesSlow vfs =
-  defineEarlyCutoff $ \GetFileExists file -> fileExistsSlow vfs file
-
-fileExistsSlow :: VFSHandle -> NormalizedFilePath -> Action (Maybe BS.ByteString, ([a], Maybe Bool))
-fileExistsSlow vfs file = do
-    -- See Note [Invalidating file existence results]
-    alwaysRerun
-    exist <- liftIO $ getFileExistsVFS vfs file
-    pure (summarizeExists exist, ([], Just exist))
 
 getFileExistsVFS :: VFSHandle -> NormalizedFilePath -> IO Bool
 getFileExistsVFS vfs file = do
