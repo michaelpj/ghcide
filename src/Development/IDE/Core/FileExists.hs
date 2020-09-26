@@ -139,23 +139,24 @@ fileExistsRules getLspId ClientCapabilities{_workspace} vfs = do
   -- e.g. https://github.com/digital-asset/ghcide/issues/599
   addIdeGlobal . FileExistsStateVar =<< liftIO (newVar (FileExistsState False []))
 
-  case () of
+  watchSupported = case () of
     _ | Just WorkspaceClientCapabilities{_didChangeWatchedFiles} <- _workspace
       , Just DidChangeWatchedFilesClientCapabilities{_dynamicRegistration} <- _didChangeWatchedFiles
       , Just True <- _dynamicRegistration
-        -> fileExistsRulesFast getLspId vfs
-      | otherwise -> do
-        logger <- logger <$> getShakeExtrasRules
-        liftIO $ logDebug logger "Warning: Client does not support watched files. Falling back to OS polling"
-        fileExistsRulesSlow vfs
+        -> pure True
+      | otherwise -> False
 
--- Requires an lsp client that provides WatchedFiles notifications, but assumes that this has already been checked.
-fileExistsRulesFast :: IO LspId -> VFSHandle -> Rules ()
-fileExistsRulesFast getLspId vfs = do
+  unless watchSupported $ do
+      logger <- logger <$> getShakeExtrasRules
+      liftIO $ logDebug logger "Warning: Client does not support watched files. Falling back to OS polling"
+
+  fileExistsRules watchSupported getLspId vfs
+
+fileExistsRules :: Bool -> IO LspId -> VFSHandle -> Rules ()
+fileExistsRules watchSupported getLspId vfs = do
     defineEarlyCutoff $ \GetFileExists file -> do
       alwaysRerun
-      isWf <- isWorkspaceFile file
-      if isWf
+      if watchSupported
           then fileExistsFast getLspId vfs file
           else fileExistsSlow vfs file
 
@@ -230,17 +231,12 @@ fileExistsFast getLspId vfs file = do
     case mbFilesWatched of
       Just exist -> pure (summarizeExists exist, ([], Just exist))
       -- We don't know about it: back to fileExistsSlow we go.
-
-    -- We need to call it explicitly so we invalidate the rule result for this
+      -- We need to call it explicitly so we invalidate the rule result for this
       -- case correctly, see Note [Invalidating file existence results]
       Nothing -> fileExistsSlow vfs file
 
 summarizeExists :: Bool -> Maybe BS.ByteString
 summarizeExists x = Just $ if x then BS.singleton 1 else BS.empty
-
-fileExistsRulesSlow :: VFSHandle -> Rules ()
-fileExistsRulesSlow vfs =
-  defineEarlyCutoff $ \GetFileExists file -> alwaysRerun >> fileExistsSlow vfs file
 
 fileExistsSlow :: VFSHandle -> NormalizedFilePath -> Action (Maybe BS.ByteString, ([a], Maybe Bool))
 fileExistsSlow vfs file = do
