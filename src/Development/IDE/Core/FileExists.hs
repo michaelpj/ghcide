@@ -77,33 +77,13 @@ modifyFileExistsStateAction f = do
   FileExistsStateVar var <- getIdeGlobalAction
   liftIO $ modifyVar_ var f
 
-{- Note [Invalidating file existence results]
-We have two mechanisms for getting file existence information:
-- The file existence cache
-- The VFS lookup
-
-Both of these affect the results of the 'GetFileExists' rule, so we need to make sure it
-is invalidated properly when things change.
-
-For the file existence cache, we manually flush the results of 'GetFileExists' when we
-modify it (i.e. when a notification comes from the client).
-
-For the VFS lookup, however, we won't get prompted to flush the result, so instead
-we use 'alwaysRerun'.
--}
-
 -- | Modify the global store of file exists.
 modifyFileExists :: IdeState -> [(NormalizedFilePath, Bool)] -> IO ()
 modifyFileExists state changes = do
   FileExistsStateVar var <- getIdeGlobalState state
-  changesMap           <- evaluate $ HashMap.fromList changes
-
-  -- Masked to ensure that the previous values are flushed together with the map update
-  mask $ \_ -> do
-    -- update the map
-    modifyVar_ var $ \st -> evaluate $ st{fileExistsMap=HashMap.union changesMap (fileExistsMap st)}
-    -- flush previous values, see Note [Invalidating file existence results]
-    mapM_ (deleteValue state GetFileExists . fst) changes
+  changesMap             <- evaluate $ HashMap.fromList changes
+  -- Update the map. No need to invalidate anything, since the rules are 'alwaysRerun'
+  modifyVar_ var $ \st -> evaluate $ st{fileExistsMap=HashMap.union changesMap (fileExistsMap st)}
 
 -------------------------------------------------------------------------------------
 
@@ -150,10 +130,13 @@ fileExistsRules getLspId ClientCapabilities{_workspace} vfs = do
         liftIO $ logDebug logger "Warning: Client does not support watched files. Falling back to OS polling"
 
     defineEarlyCutoff $ \GetFileExists file -> do
-      alwaysRerun
-      if watchSupported
-          then fileExistsFast getLspId vfs file
-          else fileExistsSlow vfs file
+        -- We don't generally know when this has been invalidated if we had to do a VFS lookup. We *could*
+        -- track invalidation better for cases that are tracked in the file existence cache, but the rule
+        -- is cheap, just a hash map lookup, so always rerunning is good enough.
+        alwaysRerun
+        if watchSupported
+            then fileExistsFast getLspId vfs file
+            else fileExistsSlow vfs file
 
 {- Note [Which files should we watch?]
 The watcher system gives us a lot of flexibility: we can set multiple watchers, and they can all watch on glob
@@ -226,8 +209,6 @@ fileExistsFast getLspId vfs file = do
     case mbFilesWatched of
       Just exist -> pure (summarizeExists exist, ([], Just exist))
       -- We don't know about it: back to fileExistsSlow we go.
-      -- We need to call it explicitly so we invalidate the rule result for this
-      -- case correctly, see Note [Invalidating file existence results]
       Nothing -> fileExistsSlow vfs file
 
 summarizeExists :: Bool -> Maybe BS.ByteString
@@ -235,7 +216,6 @@ summarizeExists x = Just $ if x then BS.singleton 1 else BS.empty
 
 fileExistsSlow :: VFSHandle -> NormalizedFilePath -> Action (Maybe BS.ByteString, ([a], Maybe Bool))
 fileExistsSlow vfs file = do
-    -- See Note [Invalidating file existence results]
     exist <- liftIO $ getFileExistsVFS vfs file
     pure (summarizeExists exist, ([], Just exist))
 
